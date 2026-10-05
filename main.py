@@ -67,7 +67,8 @@ from .core.stats import build_report
 from .core.storage import Storage
 from .core.textutil import clean_text, clip, is_noise
 
-PLUGIN_NAME = "astrbot_plugin_intent_router"
+PLUGIN_NAME = "astrbot_plugin_vw_intent_router"
+LEGACY_PLUGIN_NAMES = ("astrbot_plugin_intent_router",)
 # 比默认 0 高：先于普通插件看到消息，才能决定要不要拦下来
 HANDLER_PRIORITY = 100
 # 比 VM 的 -100 高，这样"主动插嘴"的约束会追加在它那段世界认知之后
@@ -100,6 +101,31 @@ PROACTIVE_HINT = (
 )
 
 
+def _migrate_data_dir(path: str) -> str:
+    """插件改名后，把老数据目录整体搬过来（router.db / overrides.json 都在里面）。
+
+    搬不动（比如被别的进程占着）就继续用老目录，绝不让数据「凭空消失」。
+    """
+
+    if os.path.exists(path):
+        return path
+    parent = os.path.dirname(path)
+    for legacy_name in LEGACY_PLUGIN_NAMES:
+        legacy = os.path.join(parent, legacy_name)
+        if not os.path.isdir(legacy):
+            continue
+        try:
+            os.replace(legacy, path)
+        except OSError as exc:
+            logger.warning(
+                f"intent_router: 数据目录改名迁移失败（{exc}），继续使用老目录 {legacy}"
+            )
+            return legacy
+        logger.info(f"intent_router: 数据目录已随插件改名迁移：{legacy} → {path}")
+        return path
+    return path
+
+
 def _resolve_data_dir(plugin_dir: str) -> str:
     """数据目录：AstrBot 的 data/plugin_data/<插件名>/（可用环境变量覆盖）。"""
 
@@ -109,7 +135,9 @@ def _resolve_data_dir(plugin_dir: str) -> str:
     try:
         from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 
-        return os.path.join(get_astrbot_plugin_data_path(), PLUGIN_NAME)
+        return _migrate_data_dir(
+            os.path.join(get_astrbot_plugin_data_path(), PLUGIN_NAME)
+        )
     except Exception:
         return os.path.join(plugin_dir, "data")
 
@@ -166,6 +194,9 @@ class IntentRouterPlugin(Star):
         self._help_until: dict[str, float] = {}
         self._judge_semaphore = asyncio.Semaphore(self.settings.concurrency)
         self._flush_task: Optional[asyncio.Task] = None
+        # 每个群派出去的刷新任务（只为 terminate 时一起收掉），以及正在刷新的会话名
+        self._flushing: set[asyncio.Task] = set()
+        self._flushing_umos: set[str] = set()
         self._delayed: set[asyncio.Task] = set()
         self._seq = 0
         self._vm_logged = False
@@ -183,6 +214,7 @@ class IntentRouterPlugin(Star):
             "safety_blocked": 0,
             "safety_flagged": 0,
             "judge_failed": 0,
+            "judge_timeout": 0,
             "dropped_stale": 0,
             "dropped_overflow": 0,
             "reinject_failed": 0,
@@ -241,6 +273,11 @@ class IntentRouterPlugin(Star):
         for pending in list(self._delayed):
             pending.cancel()
         self._delayed.clear()
+        # 正在判断的那几个群也要收掉，别留着任务在下线后往回发消息
+        for pending in list(self._flushing):
+            pending.cancel()
+        self._flushing.clear()
+        self._flushing_umos.clear()
         try:
             self.storage.close()
         except Exception:
@@ -679,15 +716,41 @@ class IntentRouterPlugin(Star):
                         due.append(umo)
                     elif now >= self._deadlines.get(umo, 0.0):
                         due.append(umo)
+                if not due:
+                    continue
+                # 每个群的判断各自派一个任务：谁慢都不影响别的群，也不拖住下一轮扫描。
+                # 真正同时在跑的模型调用由 _judge_semaphore（settings.concurrency）兜住，
+                # 单次调用还有 judge_timeout 兜底，所以一个群卡住不会再让所有群停摆。
                 for umo in due:
-                    try:
-                        await self._flush_group(umo)
-                    except Exception as exc:
-                        logger.error(f"intent_router: 刷新缓冲失败 umo={umo}：{exc}")
+                    self._spawn_flush(umo)
             except asyncio.CancelledError:
                 break
             except Exception as exc:
                 logger.error(f"intent_router: 后台刷新循环异常：{exc}")
+
+    def _spawn_flush(self, umo: str) -> None:
+        """把一个群的判断派出去自己跑（同一个群同一时刻只派一个）。"""
+
+        if umo in self._flushing_umos:
+            return
+        self._flushing_umos.add(umo)
+
+        async def run() -> None:
+            try:
+                await self._flush_group(umo)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error(f"intent_router: 刷新缓冲失败 umo={umo}：{exc}")
+
+        task = asyncio.create_task(run())
+        self._flushing.add(task)
+
+        def done(finished: asyncio.Task) -> None:
+            self._flushing.discard(finished)
+            self._flushing_umos.discard(umo)
+
+        task.add_done_callback(done)
 
     async def _flush_group(self, umo: str) -> None:
         items: list[dict[str, Any]] = []
@@ -1331,17 +1394,36 @@ class IntentRouterPlugin(Star):
         }
         if self.settings.json_mode:
             kwargs["response_format"] = {"type": "json_object"}
+        # 超时兜底：判断模型不回话时不能一直挂着——挂了就按 fail_mode 处理，
+        # 而不是把这个会话（乃至别的会话）的缓冲一起卡死。
+        timeout = max(1.0, float(self.settings.judge_timeout))
         async with self._judge_semaphore:
             try:
-                response = await provider.text_chat(
-                    prompt=user_prompt, system_prompt=system_prompt, **kwargs
+                response = await asyncio.wait_for(
+                    provider.text_chat(
+                        prompt=user_prompt, system_prompt=system_prompt, **kwargs
+                    ),
+                    timeout=timeout,
                 )
+            except asyncio.TimeoutError:
+                self.counters["judge_timeout"] += 1
+                logger.warning(f"intent_router: 判断超时（>{timeout:.0f}s），按判断失败处理")
+                return "", f"判断超时（>{timeout:.0f}s）"
             except Exception as exc:
                 logger.debug(f"intent_router: 带参调用失败（{exc}），退回最小参数重试")
                 try:
-                    response = await provider.text_chat(
-                        prompt=user_prompt, system_prompt=system_prompt
+                    response = await asyncio.wait_for(
+                        provider.text_chat(
+                            prompt=user_prompt, system_prompt=system_prompt
+                        ),
+                        timeout=timeout,
                     )
+                except asyncio.TimeoutError:
+                    self.counters["judge_timeout"] += 1
+                    logger.warning(
+                        f"intent_router: 判断超时（>{timeout:.0f}s），按判断失败处理"
+                    )
+                    return "", f"判断超时（>{timeout:.0f}s）"
                 except Exception as retry_exc:
                     return "", str(retry_exc)
         if response is None:

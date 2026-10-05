@@ -207,9 +207,15 @@
   },
   "concurrency": {
     "description": "同时判断几批",
-    "hint": "默认 4。",
+    "hint": "默认 4。多个群同时到期时，最多这么多批的模型调用同时在跑。",
     "type": "int",
     "default": 4
+  },
+  "judge_timeout": {
+    "description": "判断超时（秒）",
+    "hint": "判断模型多少秒不回话就算失败（按「判断失败时怎么办」处理）。默认 30。",
+    "type": "float",
+    "default": 30
   },
   "web_enabled": {
     "description": "启用网页看板",

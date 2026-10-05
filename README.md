@@ -110,7 +110,8 @@ decision = event.get_extra("intent_router_decision")
 
 ## 数据
 
-都在 AstrBot 的 `data/plugin_data/astrbot_plugin_intent_router/`：
+都在 AstrBot 的 `data/plugin_data/astrbot_plugin_vw_intent_router/`（v2.6 改名前的
+`astrbot_plugin_intent_router/` 会在启动时自动搬过来）：
 
 | 文件 | 内容 |
 | --- | --- |

@@ -146,6 +146,7 @@ class Settings:
     temperature: float = 0.1
     max_tokens: int = 120
     concurrency: int = 4
+    judge_timeout: float = 30.0
     debug: bool = False
     passthrough: bool = False
     web_enabled: bool = True
@@ -235,6 +236,7 @@ def settings_from_config(config: Any, *, data_dir: str = "") -> Settings:
         temperature=cfg_num(config, "temperature", 0.1),
         max_tokens=max(16, cfg_int(config, "max_tokens", 120)),
         concurrency=max(1, cfg_int(config, "concurrency", 4)),
+        judge_timeout=max(1.0, cfg_num(config, "judge_timeout", 30)),
         debug=cfg_bool(config, "debug", False),
         passthrough=cfg_bool(config, "passthrough", False),
         web_enabled=cfg_bool(config, "web_enabled", True),
