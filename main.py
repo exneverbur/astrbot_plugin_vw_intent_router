@@ -1,0 +1,1663 @@
+"""智能意图路由（v2）：判断群里的消息值不值得让主人格开口。
+
+分三层，各管各的：
+
+- **路由模型**（`core/judge.py`）只判内容，输出 0~1 结构化分数，不生成回复；
+- **本插件**（这个文件）负责概率、熔断、排队、放行/拦截、记录与统计；
+- **虚拟世界 VM**（可选）只提供一个「她现在想不想说话」的意愿值。
+
+她说过的话由**发送层钩子**统一记录（不区分来源——其他插件不会配合我们，
+所以任何发送动作都算她开口了），密度惩罚、硬熔断都基于这份记录。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import copy
+import json
+import os
+import random
+import time
+import uuid
+from collections import deque
+from pathlib import Path
+from typing import Any, Optional
+
+from astrbot.api import AstrBotConfig, logger
+from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.message_components import At, Reply
+from astrbot.api.star import Context, Star, register
+
+try:  # 看板用的 Web API 工具；老版本 AstrBot / 单测环境里可能没有
+    from astrbot.api.web import error_response, json_response, request
+except Exception:  # pragma: no cover - 只在缺少 web 模块时走到
+    request = None  # type: ignore[assignment]
+
+    def json_response(data: Any = None, status_code: int = 200, headers: Any = None) -> Any:
+        return {"status": "ok", "data": data, "status_code": status_code}
+
+    def error_response(message: str, status_code: int = 400, data: Any = None, headers: Any = None) -> Any:
+        return {"status": "error", "message": message, "status_code": status_code}
+
+from .core.config import (
+    OverrideStore,
+    RuntimeStore,
+    Tunable,
+    cfg_bool,
+    cfg_int,
+    cfg_list,
+    cfg_str,
+    settings_from_config,
+)
+from .core.decision import (
+    BLOCKED,
+    IGNORE,
+    PROACTIVE,
+    REPLY,
+    SAFETY,
+    Verdict,
+    decide_proactive,
+    decide_reply,
+)
+from .core.judge import JudgeCache, JudgePrompt, cache_key, parse_judge_output
+from .core.provider import MODE_AUTO, WillingnessProvider
+from .core.registry import Registry
+from .core.safety import SafetyLayer
+from .core.stats import build_report
+from .core.storage import Storage
+from .core.textutil import clean_text, clip, is_noise
+
+PLUGIN_NAME = "astrbot_plugin_intent_router"
+# 比默认 0 高：先于普通插件看到消息，才能决定要不要拦下来
+HANDLER_PRIORITY = 100
+# 比 VM 的 -100 高，这样"主动插嘴"的约束会追加在它那段世界认知之后
+LLM_HOOK_PRIORITY = 90
+REINJECT_EXTRA = "intent_router_reinject"
+# 交给下游插件（虚拟世界）的整批判定：谁被放行了、整批逐条判成什么样。
+# 「这句是不是冲她说的」只有路由模型在事前判得出来，而放行的消息会被重投，
+# 下游就在那一次读到它（见 docs 里的交接说明）。
+DECISION_EXTRA = "intent_router_decision"
+PROACTIVE_EXTRA = "intent_router_proactive"
+# 一批里更早的几句：虚拟世界正在照看这个会话时 _burst_lead 不往正文里拼，
+# 改挂在这上面，由 on_llm_request 作为「背景」补进系统提示词（见 _burst_background）。
+BACKGROUND_EXTRA = "intent_router_background"
+# 重注入时补的 @ 是假的：原话里没人 @ 她，只是"顺着话题对她说"。
+# 别的插件用这个标记区分两种情况。
+NO_AT_EXTRA = "intent_router_no_at"
+DATA_DIR_ENV = "INTENT_ROUTER_DATA_DIR"
+# 合并放行时，最多把同一批里更早的几句折成背景带上（最新的那几条）
+BURST_LEAD_LINES = 6
+# 「她在等群友拿主意」时问虚拟世界要多久、多久问一次：
+# 问得太勤会跟着每条消息跑一次调用，问得太稀会错过那两三分钟的窗口
+HELP_ASK_TIMEOUT = 0.4
+HELP_ASK_CACHE_SECONDS = 4.0
+
+PROACTIVE_HINT = (
+    "\n\n【这一条是偶尔插一句】\n"
+    "只偶尔插一句，不展开、不追问、不@人。\n"
+    "不超过20字，符合角色口吻。\n"
+    "接得住梗就接，接不住就短吐槽。不刷存在感。"
+)
+
+
+def _resolve_data_dir(plugin_dir: str) -> str:
+    """数据目录：AstrBot 的 data/plugin_data/<插件名>/（可用环境变量覆盖）。"""
+
+    override = (os.environ.get(DATA_DIR_ENV) or "").strip()
+    if override:
+        return override
+    try:
+        from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
+
+        return os.path.join(get_astrbot_plugin_data_path(), PLUGIN_NAME)
+    except Exception:
+        return os.path.join(plugin_dir, "data")
+
+
+@register(
+    PLUGIN_NAME,
+    "exneverbur",
+    "智能意图路由：判断群里的消息值不值得让主人格开口回复",
+    "v2.5",
+)
+class IntentRouterPlugin(Star):
+    def __init__(self, context: Context, config: AstrBotConfig) -> None:
+        super().__init__(context, config)
+        self.config = config
+        self.data_dir = _resolve_data_dir(os.path.dirname(os.path.abspath(__file__)))
+        self.settings = settings_from_config(config, data_dir=self.data_dir)
+        self.overrides = OverrideStore(Path(self.data_dir) / "overrides.json")
+        self.tunable: Tunable = self.overrides.load()
+        self.runtime = RuntimeStore(
+            Path(self.data_dir) / "runtime.json",
+            {"enable": bool(self.settings.enable)},
+        )
+        self._runtime = self.runtime.load()
+
+        self.storage = Storage(Path(self.data_dir) / "router.db")
+        self.registry = Registry(self.storage, self.tunable)
+        self.provider = WillingnessProvider(
+            mode=MODE_AUTO,
+            tunable=self.tunable,
+            vm_getter=lambda: self._virtual_world_plugin(),
+        )
+        self.safety = SafetyLayer(
+            block_words=cfg_list(config, "block_words"),
+            flag_words=cfg_list(config, "flag_words"),
+            block_regex=cfg_list(config, "block_regex"),
+            max_length=max(200, cfg_int(config, "max_text_length", 2000)),
+        )
+        self.judge_prompt = JudgePrompt(self.settings)
+        self.cache = JudgeCache(
+            ttl=self.settings.cache_ttl, capacity=self.settings.cache_cap
+        )
+        self.enable = bool(self._runtime.get("enable", self.settings.enable))
+        self.debug = bool(self.settings.debug)
+
+        # ---------------- 运行时状态 ----------------
+        self._buffers: dict[str, deque] = {}
+        self._buffer_lock = asyncio.Lock()
+        self._history: dict[str, deque] = {}
+        self._deadlines: dict[str, float] = {}
+        # 每个会话上一次「真的开口」的时刻（含排队延迟），用来算最小间隔
+        self._last_release: dict[str, float] = {}
+        # 「她正在等群友拿主意」的窗口（虚拟世界告诉我们），以及问它的结果缓存
+        self._help_cache: dict[str, tuple[float, float]] = {}
+        self._help_until: dict[str, float] = {}
+        self._judge_semaphore = asyncio.Semaphore(self.settings.concurrency)
+        self._flush_task: Optional[asyncio.Task] = None
+        self._delayed: set[asyncio.Task] = set()
+        self._seq = 0
+        self._vm_logged = False
+        self.counters: dict[str, int] = {
+            "noise": 0,
+            "cache_hits": 0,
+            "judged": 0,
+            "judge_calls": 0,
+            "released": 0,
+            "help_released": 0,
+            "delayed": 0,
+            "merged": 0,
+            "blocked": 0,
+            "proactive": 0,
+            "safety_blocked": 0,
+            "safety_flagged": 0,
+            "judge_failed": 0,
+            "dropped_stale": 0,
+            "dropped_overflow": 0,
+            "reinject_failed": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
+        self._register_web_apis()
+        logger.info(
+            "intent_router v2 已加载：批量=%s(%d条/%.0fs) 判断模型=%s 主动插嘴=%s",
+            "开" if self.settings.enable_batch else "关",
+            self.settings.batch_size,
+            self.settings.batch_interval,
+            self.settings.judge_provider_id or "(会话默认)",
+            "开" if self.tunable.proactive_enabled else "关",
+        )
+
+    # ==================================================================
+    # 生命周期
+    # ==================================================================
+
+    async def initialize(self) -> None:
+        if self._flush_task is None or self._flush_task.done():
+            self._flush_task = asyncio.create_task(self._flush_loop())
+        if not str(self.settings.bot_name or "").strip() and not list(self.settings.aliases or []):
+            # 这俩空着的时候，"有人叫她名字"这件事在整条链路里都没有依据：
+            # 正文里的名字不会被标成线索（alias_hits 恒空），判断模型也不知道她叫什么，
+            # 于是"@ 之外的呼唤"（「蓝蓝在吗」）只能靠语气猜，猜错就是永久不回。
+            logger.warning(
+                "intent_router: 没填「机器人名字 / 别名」，判断模型无法识别别人在叫她"
+                "（@ 她仍然直接放行）。建议在配置里填上名字，或把 alias_policy 设为 direct"
+            )
+        try:
+            self.storage.prune(self.tunable.keep_days)
+        except Exception as exc:
+            logger.debug(f"intent_router: 清理历史数据失败：{exc}")
+        vm = self._virtual_world_plugin()
+        if vm is not None:
+            logger.info("intent_router: 检测到「虚拟世界」，意愿值跟随她在那个世界里的状态")
+            self._vm_logged = True
+        else:
+            logger.info(
+                "intent_router: 没检测到「虚拟世界」，意愿值用固定 %.2f"
+                "（运行中会一直重试，装上就自动接上）",
+                self.tunable.willingness_default,
+            )
+
+    async def terminate(self) -> None:
+        task, self._flush_task = self._flush_task, None
+        if task is not None:
+            task.cancel()
+            try:
+                await asyncio.wait_for(task, timeout=5)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+        for pending in list(self._delayed):
+            pending.cancel()
+        self._delayed.clear()
+        try:
+            self.storage.close()
+        except Exception:
+            pass
+        logger.info("intent_router 已卸载")
+
+    # ==================================================================
+    # 钩子
+    # ==================================================================
+
+    @filter.event_message_type(
+        filter.EventMessageType.GROUP_MESSAGE, priority=HANDLER_PRIORITY
+    )
+    async def on_message(self, event: AstrMessageEvent) -> None:
+        try:
+            await self._route(event)
+        except Exception as exc:  # 出问题也必须放行，别把人堵在门口
+            logger.error(f"intent_router: 处理消息异常：{exc}", exc_info=True)
+
+    @filter.after_message_sent()
+    async def on_bot_message_sent(self, event: AstrMessageEvent) -> None:
+        """发送层钩子：只要有发送动作就算她开口了。
+
+        不去识别是哪个插件发的、也不判断发送成没成功——其他插件不会配合我们，
+        而"她说了话"这件事本身就是密度惩罚最需要的信号。
+        """
+
+        try:
+            self.registry.record_speech(event.unified_msg_origin)
+        except Exception as exc:
+            logger.debug(f"intent_router: 记录发言失败：{exc}")
+
+    @filter.on_llm_request(priority=LLM_HOOK_PRIORITY)
+    async def on_llm_request(self, event: AstrMessageEvent, req: Any) -> None:
+        """给主人格补两样东西：主动插嘴的约束；以及被顶掉的那段批量背景。
+
+        背景这一段只在"虚拟世界正在照看这个会话"时才有（见 :meth:`_burst_background`）：
+        那种情况下 ``_burst_lead`` 为了不重复而放弃了往正文里拼更早的几句，
+        如果那几句里有人正是在叫她，她就永远不知道自己被叫了——所以改成从
+        系统提示词这条不冲突的路补上。
+        """
+
+        parts: list[str] = []
+        try:
+            if event.get_extra(PROACTIVE_EXTRA):
+                parts.append(PROACTIVE_HINT)
+            background = str(event.get_extra(BACKGROUND_EXTRA) or "")
+            if background:
+                parts.append(background)
+            if parts:
+                req.system_prompt = (getattr(req, "system_prompt", "") or "") + "".join(parts)
+        except Exception as exc:
+            logger.debug(f"intent_router: 注入提示词失败：{exc}")
+
+    @filter.command("router", alias={"意图路由", "ir"})
+    async def cmd_router(self, event: AstrMessageEvent):
+        args = (event.get_message_str() or "").strip().split()
+        sub = args[1].lower() if len(args) > 1 else "stats"
+        umo = event.unified_msg_origin
+        if sub in ("stats", "状态"):
+            report = build_report(
+                storage=self.storage,
+                provider_status=self.provider.status(),
+                counters=self.counters,
+                tunable=self.tunable,
+                umo=umo,
+                window_seconds=86400,
+                recent_limit=5,
+            )
+            counts = report["counts"]["by_decision"]
+            yield event.plain_result(
+                "意图路由（近 24 小时）：\n"
+                f"· 判断 {report['counts']['judged']} 条，放行 {counts.get(REPLY, 0)}、"
+                f"插嘴 {counts.get(PROACTIVE, 0)}、熔断 {counts.get(BLOCKED, 0)}、"
+                f"不回 {counts.get(IGNORE, 0)}\n"
+                f"· 意愿来源 {report['willingness_provider']['mode']}"
+                f"（熔断中：{'是' if report['willingness_provider']['breaker_open'] else '否'}）\n"
+                f"· 最近：W={report['latest']['weighted_recent_W']} "
+                f"load={report['latest']['normalized_load']} "
+                f"willingness={report['latest']['willingness']}"
+            )
+            return
+        if sub in ("on", "off", "开", "关"):
+            if not event.is_admin():
+                yield event.plain_result("只有管理员可以开关意图路由。")
+                return
+            self.enable = sub in ("on", "开")
+            yield event.plain_result("意图路由已" + ("开启" if self.enable else "关闭"))
+            return
+        if sub in ("good", "bad", "对", "错"):
+            if len(args) < 3:
+                yield event.plain_result("用法：/router good|bad <判定 id>")
+                return
+            value = "good" if sub in ("good", "对") else "bad"
+            ok = self.storage.set_feedback(int(args[2]), value)
+            yield event.plain_result("已记下这条判定" if ok else "没找到这条判定")
+            return
+        yield event.plain_result(
+            "意图路由指令：\n"
+            "· /router stats        看当前群的统计\n"
+            "· /router on|off       开关（管理员）\n"
+            "· /router good|bad <id> 标记这条判断对不对（看板里也能标）"
+        )
+
+    # ==================================================================
+    # 路由主流程
+    # ==================================================================
+
+    async def _route(self, event: AstrMessageEvent) -> None:
+        if not self.enable:
+            return
+        if event.get_sender_id() and event.get_sender_id() == event.get_self_id():
+            return
+        if event.get_extra(REINJECT_EXTRA, False):
+            return  # 本插件重注入的消息，放行
+        text = clean_text(event.message_str or "")
+        umo = event.unified_msg_origin
+
+        # 「收到消息」先落一行：判断是后到的，这一行先保证**每条消息都进日志**。
+        # 之后无论走哪条分支，都只用 UPDATE 把这一行补完，不会多出第二条。
+        row_id = self._log_incoming(event, umo, text)
+
+        if text:
+            self._history_append(umo, text)
+
+        # 直接指向她 / 命令：规则触发，不过模型
+        direct = self._direct_reason(event)
+        if direct:
+            self._close_row(row_id, umo, text, "direct", direct)
+            return
+        if not self._in_scope(event):
+            self._close_row(row_id, umo, text, "out_of_scope", "不在路由生效的群 / 私聊范围里")
+            return
+        if not text:
+            self._close_row(row_id, umo, text, "no_text", "没有文本内容（纯图片 / 表情等）")
+            return  # 纯图片等没有文本的消息不判断
+
+        safety = self.safety.check(text)
+        if safety.blocked:
+            self.counters["safety_blocked"] += 1
+            logger.info("intent_router: 安全层拦下一条消息（%s）", safety.reason)
+            self._close_row(row_id, umo, text, "safety", f"安全层拦下：{safety.reason}")
+            self._block_event(event)
+            return
+        if safety.flagged:
+            self.counters["safety_flagged"] += 1
+
+        # 命中了她的名字 / 别名：**交给判断模型**（默认），不当作"直接放行"——
+        # 中文里叫名字可能是叫别人、在讨论她、或者只是口头禅。只有"太短"这条
+        # 噪音判定给它让路：两个字的「蓝蓝」正是在叫她。
+        alias_hits = (
+            [] if self.settings.alias_policy == "direct" else self._alias_hits(text)
+        )
+        if alias_hits:
+            # 只当线索：不给它"直接放行"的待遇，但日志里要能看出这条为什么进判断
+            self.counters["alias_hint"] = int(self.counters.get("alias_hint", 0)) + 1
+            logger.info(
+                "intent_router: 命中了名字「%s」，交给判断模型：%s",
+                "、".join(alias_hits),
+                clip(text, 40),
+            )
+        if is_noise(text, min_length=self.settings.min_length, noise_words=self.settings.noise_words):
+            if not alias_hits:
+                self.counters["noise"] += 1
+                self._close_row(row_id, umo, text, "noise", "太短或像语气词，不值得判断")
+                self._block_event(event)
+                return
+
+        key = cache_key(
+            umo,
+            text,
+            sender=str(event.get_sender_id() or ""),
+            reply_to=self._reply_target_id(event),
+        )
+        now = time.time()
+        cached = self.cache.get(key, now)
+        if cached is not None:
+            self.counters["cache_hits"] += 1
+            await self._apply_decision(
+                event=event,
+                umo=umo,
+                text=text,
+                verdict=cached,
+                cached=True,
+                deferred=False,
+                judgement_id=row_id,
+            )
+            return
+
+        item = self._make_item(
+            event, text, key, judgement_id=row_id, alias_hits=alias_hits
+        )
+        if self.settings.enable_batch:
+            # 她正在群里等群友拿主意时，这几分钟里的消息要尽快交到她手里
+            deadline = await self._intervention_deadline(umo)
+            if deadline > 0:
+                self._help_until[umo] = deadline
+            self._buffer_add(umo, item)
+            self._block_event(event)
+            return
+        await self._judge_and_decide([item], umo, deferred=False)
+
+    async def _intervention_deadline(self, umo: str) -> float:
+        """她在等群友拿主意吗？问一次虚拟世界，结果缓存几秒。
+
+        没装虚拟世界、调用超时、出错——一律返回 0，路由照旧工作（同一条不变量）。
+        """
+
+        now = time.time()
+        cached_at, cached_until = self._help_cache.get(umo, (0.0, 0.0))
+        if now - cached_at < HELP_ASK_CACHE_SECONDS:
+            return cached_until if cached_until > now else 0.0
+        until = 0.0
+        vm = self._virtual_world_plugin()
+        getter = getattr(vm, "pending_intervention", None) if vm is not None else None
+        if callable(getter):
+            try:
+                raw = await asyncio.wait_for(getter(umo), timeout=HELP_ASK_TIMEOUT)
+                until = float(raw or 0.0)
+            except Exception as exc:
+                logger.debug(f"intent_router: 问虚拟世界有没有待协助失败：{exc}")
+                until = 0.0
+        if until <= now:
+            until = 0.0
+        self._help_cache[umo] = (now, until)
+        if len(self._help_cache) > 200:
+            self._help_cache.clear()
+            self._help_cache[umo] = (now, until)
+        return until
+
+    def _help_active(self, umo: str) -> bool:
+        """这个会话现在是不是处在「等她拿到回应」的窗口里。"""
+
+        until = float(self._help_until.get(umo, 0.0))
+        if until <= time.time():
+            self._help_until.pop(umo, None)
+            return False
+        return True
+
+    def _is_direct(self, event: AstrMessageEvent) -> bool:
+        """直接指向她（@、回复、唤醒前缀、命令、叫名字）→ 直接放行，不花判断的钱。"""
+
+        return bool(self._direct_reason(event))
+
+    def _direct_reason(self, event: AstrMessageEvent) -> str:
+        """直接指向她的原因（空串 = 没指向她）。
+
+        规则放行的这几类不过判断模型，但理由要留在流水里：
+        看板上"这条为什么没判"必须一眼看得出。
+        """
+
+        if getattr(event, "is_at_or_wake_command", False):
+            return "有人 @ 她或用了唤醒词，直接放行"
+        if event.get_extra("handlers_parsed_params", {}):
+            return "指令参数已解析，直接放行"
+        text = event.message_str or ""
+        if text.startswith(("/", "!", "！")):
+            return "是一条指令，直接放行"
+        for prefix in self.settings.pass_prefixes:
+            if prefix and text.startswith(prefix):
+                return f"以「{prefix}」开头，直接放行"
+        if self.settings.alias_policy == "direct":
+            for alias in self._alias_hits(text):
+                return f"提到了名字「{alias}」，直接放行"
+        return ""
+
+    def _alias_hits(self, text: str) -> list[str]:
+        """正文里出现了哪些"她"的名字 / 别名（按出现顺序，去重）。"""
+
+        lowered = str(text or "").lower()
+        hits: list[str] = []
+        if not lowered:
+            return hits
+        for alias in self.settings.aliases:
+            name = str(alias or "").strip()
+            if not name or name in hits:
+                continue
+            if name.lower() in lowered:
+                hits.append(name)
+        return hits
+
+    def _in_scope(self, event: AstrMessageEvent) -> bool:
+        gid = event.get_group_id()
+        if self.settings.whitelist and gid not in self.settings.whitelist:
+            return False
+        return not (gid and gid in self.settings.blacklist)
+
+    def _block_event(self, event: AstrMessageEvent) -> None:
+        try:
+            event.stop_event()
+        except Exception:
+            pass
+
+    def _mark_wake(self, event: AstrMessageEvent) -> None:
+        try:
+            event.is_wake = True
+        except Exception:
+            pass
+
+    # ==================================================================
+    # 流水：每条消息先占一行，判定结果后补
+    # ==================================================================
+
+    def _log_incoming(self, event: AstrMessageEvent, umo: str, text: str) -> int:
+        """一条消息到达插件时先占一行流水（decision 暂时是 ``pending``）。
+
+        这样"她为什么没反应"永远能查到：是没到这条插件、还是被规则放行了、
+        还是被判成不值得回。
+        """
+
+        try:
+            return self.storage.record_judgement(
+                umo=umo,
+                ts=time.time(),
+                sender=self._sender_name(event),
+                text=text,
+                worth=False,
+                scores={},
+                decision="pending",
+                probability=0.0,
+                breakdown={"stage": "incoming"},
+                reason="收到消息，等待判断",
+            )
+        except Exception as exc:
+            logger.debug(f"intent_router: 写收到记录失败：{exc}")
+            return 0
+
+    def _close_row(
+        self,
+        judgement_id: int,
+        umo: str,
+        text: str,
+        decision: str,
+        reason: str,
+    ) -> None:
+        """规则直接定性的一条：把占好的那一行补成最终去向。"""
+
+        if not judgement_id:
+            return
+        try:
+            self.storage.update_judgement(
+                judgement_id,
+                worth=False,
+                scores={},
+                decision=decision,
+                probability=0.0,
+                breakdown={"stage": "rule"},
+                reason=reason,
+            )
+        except Exception as exc:
+            logger.debug(f"intent_router: 补写流水失败：{exc}")
+
+    # ==================================================================
+    # 缓冲：攒一批再判，省 token
+    # ==================================================================
+
+    def _make_item(
+        self,
+        event: AstrMessageEvent,
+        text: str,
+        key: str,
+        *,
+        judgement_id: int = 0,
+        alias_hits: list[str] | None = None,
+    ) -> dict[str, Any]:
+        self._seq += 1
+        message_obj = getattr(event, "message_obj", None)
+        return {
+            "event": event,
+            "text": text,
+            "key": key,
+            "judgement_id": int(judgement_id or 0),
+            "uuid": uuid.uuid4().hex,
+            "ts": time.time(),
+            "seq": self._seq,
+            "sender": self._sender_name(event),
+            # 交接给下游插件用的身份：它按 message_id 认自己已经留过档的那几条
+            "sender_id": str(event.get_sender_id() or ""),
+            "message_id": str(getattr(message_obj, "message_id", "") or ""),
+            "reply_to": self._reply_target_id(event),
+            "label": self._item_label(event),
+            # 正文里出现了她的名字 / 别名：给判断模型当"更可能是在跟她说话"的线索
+            "alias_hits": list(alias_hits or []),
+        }
+
+    def _item_label(self, event: AstrMessageEvent) -> str:
+        """给判断模型看的说话人标注：昵称 + 引用了谁。"""
+
+        who = self._sender_name(event)
+        quoted = self._quoted_name(event)
+        return f"{who}（回复 {quoted}）" if quoted else who
+
+    def _buffer_add(self, umo: str, item: dict[str, Any]) -> None:
+        buf = self._buffers.setdefault(umo, deque())
+        was_empty = not buf
+        buf.append(item)
+        if was_empty:
+            self._deadlines[umo] = item["ts"] + self._first_wait()
+        elif self.settings.adaptive:
+            # 群里还在说就往后挪一点，最多挪到首条入队 + batch_interval
+            grew = self._deadlines.get(
+                umo, buf[0]["ts"] + float(self.settings.interval_min)
+            ) + random.uniform(0.0, max(0.0, float(self.settings.interval_step)))
+            self._deadlines[umo] = min(
+                grew, buf[0]["ts"] + float(self.settings.batch_interval)
+            )
+        while len(buf) > 100:
+            buf.popleft()
+            self.counters["dropped_overflow"] += 1
+
+    def _first_wait(self) -> float:
+        """首条消息进队后等多久：自适应时 interval_min ~ 2×interval_min，固定时整个 batch_interval。
+
+        自适应让冷群（只有一两条）等得短、火热群随消息往后挪，最多挪到 batch_interval。
+        """
+
+        span = max(0.0, float(self.settings.batch_interval))
+        if not self.settings.adaptive:
+            return span
+        low = min(max(0.0, float(self.settings.interval_min)), span)
+        high = min(max(low, low * 2.0), span)
+        return random.uniform(low, high)
+
+    async def _flush_loop(self) -> None:
+        while True:
+            try:
+                await asyncio.sleep(1)
+                now = time.time()
+                due: list[str] = []
+                for umo, buf in list(self._buffers.items()):
+                    if not buf:
+                        continue
+                    if len(buf) >= self.settings.batch_size:
+                        due.append(umo)
+                    elif now - buf[0]["ts"] >= self.settings.batch_interval:
+                        due.append(umo)
+                    elif now >= self._deadlines.get(umo, 0.0):
+                        due.append(umo)
+                for umo in due:
+                    try:
+                        await self._flush_group(umo)
+                    except Exception as exc:
+                        logger.error(f"intent_router: 刷新缓冲失败 umo={umo}：{exc}")
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.error(f"intent_router: 后台刷新循环异常：{exc}")
+
+    async def _flush_group(self, umo: str) -> None:
+        items: list[dict[str, Any]] = []
+        async with self._buffer_lock:
+            buf = self._buffers.get(umo)
+            if not buf:
+                return
+            now = time.time()
+            while buf and now - buf[0]["ts"] > self.settings.buffer_seconds:
+                buf.popleft()
+                self.counters["dropped_stale"] += 1
+            while buf and len(items) < 20:
+                items.append(buf.popleft())
+            if not buf:
+                self._buffers.pop(umo, None)
+                self._deadlines.pop(umo, None)
+        if items:
+            await self._judge_and_decide(items, umo)
+
+    # ==================================================================
+    # 判断 + 决策 + 落库
+    # ==================================================================
+
+    async def _judge_and_decide(
+        self, items: list[dict[str, Any]], umo: str, *, deferred: bool = True
+    ) -> None:
+        """判断一批消息并落地决策。
+
+        ``deferred=True`` 表示这些消息已经被拦下、放在缓冲里了（放行要靠重注入）；
+        ``deferred=False`` 是单条即时判断，消息还活着（放行 = 什么都不做）。
+        """
+
+        verdicts = await self._judge(items, umo)
+        if not verdicts:
+            self.counters["judge_failed"] += 1
+            if self.settings.failure_policy == "pass":
+                if deferred:
+                    self._release_batch(
+                        [{"item": item, "delay": 0.0, "judgement": 0} for item in items],
+                        items,
+                        umo,
+                    )
+            elif deferred and self._help_active(umo):
+                # 判断模型挂了也不能让她干等：她正在等回应，这一批照样送到
+                self._release_batch([], items, umo)
+            else:
+                self.counters["blocked"] += len(items)
+                for item in items:
+                    self._block_event(item["event"])
+            return
+        ready: list[dict[str, Any]] = []
+        for index, item in enumerate(items, start=1):
+            verdict = verdicts.get(index)
+            if verdict is None:
+                # 模型漏了这条。以前不管配置一律当"不值得回"，但漏答通常只是 JSON 被
+                # 截断 / 条数没对上，跟"整批判定失败"是同一类事故，所以按 fail_mode 走：
+                # pass 就交给 _apply_decision（安全层、意愿、密度照旧过一遍再放行）。
+                if self.settings.failure_policy == "pass":
+                    verdict = Verdict(idx=index, worth=True, reason="judge 漏答，按放行处理")
+                    self.counters["judge_missing"] = self.counters.get("judge_missing", 0) + 1
+                else:
+                    # 模型漏了这条：当成不值得回，别去打扰主人格
+                    verdict = Verdict(idx=index, worth=False)
+                    item["verdict"] = verdict
+                    self.cache.set(item["key"], verdict, time.time())
+                    self.counters["blocked"] += 1
+                    self._close_row(
+                        int(item.get("judgement_id") or 0),
+                        umo,
+                        item["text"],
+                        "ignore",
+                        "判断结果里没有这一条，按不回处理",
+                    )
+                    self._block_event(item["event"])
+                    continue
+            self.cache.set(item["key"], verdict, time.time())
+            # 交接元数据要逐条带上判定（批次里每条各是什么结论）
+            item["verdict"] = verdict
+            release = await self._apply_decision(
+                event=item["event"],
+                umo=umo,
+                text=item["text"],
+                verdict=verdict,
+                deferred=deferred,
+                judgement_id=int(item.get("judgement_id") or 0),
+            )
+            if release is not None:
+                ready.append(
+                    {"item": item, "delay": release[0], "judgement": release[1]}
+                )
+        # 放行统一放在批处理这一层：一批里每条各自放行的话，她一句话就会回一屏
+        if deferred and (ready or self._help_active(umo)):
+            self._release_batch(ready, items, umo)
+
+    async def _apply_decision(
+        self,
+        *,
+        event: AstrMessageEvent,
+        umo: str,
+        text: str,
+        verdict: Verdict,
+        cached: bool = False,
+        deferred: bool = True,
+        judgement_id: int = 0,
+    ) -> Optional[tuple[float, int]]:
+        """把一条判断落成"回 / 插一句 / 不回"，并写进流水。
+
+        返回值：``None`` = 不回；``(延迟秒数, 流水 id)`` = 该放行。
+        放行本身交给调用方（见 :meth:`_release_batch`）：一批里每条各自放行的话，
+        她一句话就会回一屏。
+        """
+
+        now = time.time()
+        snapshot = self.registry.snapshot(umo, now)
+        willing = await self.provider.get(umo)
+
+        if willing.sleeping:
+            # 她在睡觉：静默，连记录都不用（睡眠门禁在 VM 那边也有，这里再挡一道）
+            self.counters["blocked"] += 1
+            self._close_row(judgement_id, umo, text, "blocked", "她正在睡觉，静默挡下")
+            self._block_event(event)
+            return None
+
+        safety = self.safety.check(text, risk=verdict.risk)
+        if safety.blocked:
+            self.counters["safety_blocked"] += 1
+            self._block_event(event)
+            self._persist(
+                umo=umo,
+                text=text,
+                verdict=verdict,
+                decision=SAFETY,
+                probability=0.0,
+                reason=safety.reason,
+                willing=willing.value,
+                snapshot=snapshot,
+                judgement_id=judgement_id,
+            )
+            return None
+
+        if verdict.worth:
+            outcome = decide_reply(
+                verdict,
+                willingness=willing.value,
+                density=snapshot.as_density(),
+                tunable=self.tunable,
+            )
+            judgement = self._persist(
+                umo=umo,
+                text=text,
+                verdict=verdict,
+                decision=outcome.decision,
+                probability=outcome.probability,
+                reason=outcome.reason,
+                willing=willing.value,
+                snapshot=snapshot,
+                judgement_id=judgement_id,
+            )
+            if self.debug:
+                logger.info(
+                    "intent_router 放行给 %s（stop=%s）：%s"
+                    "（worth=%s score=%.2f 意愿=%.2f 去向=%s %s）",
+                    umo,
+                    not deferred,
+                    clip(text, 40),
+                    verdict.worth,
+                    verdict.reply_score,
+                    willing.value,
+                    outcome.decision,
+                    "缓存" if cached else "",
+                )
+            return (float(outcome.delay or 0.0), judgement)
+
+        outcome = decide_proactive(
+            verdict,
+            willingness=willing.value,
+            density=snapshot.as_density(),
+            counts=snapshot.counts,
+            tunable=self.tunable,
+        )
+        judgement = self._persist(
+            umo=umo,
+            text=text,
+            verdict=verdict,
+            decision=outcome.decision,
+            probability=outcome.probability,
+            reason=outcome.reason,
+            willing=willing.value,
+            snapshot=snapshot,
+            judgement_id=judgement_id,
+        )
+        if outcome.decision == PROACTIVE and random.random() < outcome.probability:
+            self.counters["proactive"] += 1
+            try:
+                event.set_extra(PROACTIVE_EXTRA, True)
+                # 即时路径（没开批量）不重投，下游只能在 on_llm_request 里读这份判定
+                if not deferred:
+                    only = {
+                        "seq": 0,
+                        "sender": self._sender_name(event),
+                        "sender_id": str(event.get_sender_id() or ""),
+                        "text": text,
+                        "verdict": verdict,
+                    }
+                    event.set_extra(DECISION_EXTRA, self._batch_payload([only], {0}, umo))
+            except Exception:
+                pass
+            logger.info(
+                "intent_router: 主动插一句（p=%.3f）%s",
+                outcome.probability,
+                clip(text, 40),
+            )
+            return (0.0, judgement)
+        self.counters["blocked"] += 1
+        self._block_event(event)
+        if self.debug:
+            logger.info(
+                "intent_router 不回复：%s（rare=%.2f confidence=%.2f → %s）",
+                clip(text, 40),
+                verdict.rare_interject_score,
+                verdict.confidence,
+                outcome.reason,
+            )
+        return None
+
+    def _persist(
+        self,
+        *,
+        umo: str,
+        text: str,
+        verdict: Verdict,
+        decision: str,
+        probability: float,
+        reason: str,
+        willing: float,
+        snapshot: Any,
+        judgement_id: int = 0,
+    ) -> int:
+        """写一条判定流水，返回它的 id（看板上就是那一行的编号）。"""
+
+        breakdown = {
+            "willingness": round(float(willing), 4),
+            "weighted_recent": snapshot.weighted_recent,
+            "normalized_load": snapshot.normalized_load,
+            "silence_seconds": snapshot.silence_seconds,
+            "counts": snapshot.counts,
+            "to": verdict.to,
+            "directed": verdict.directed,
+            "suggested_action": verdict.suggested_action,
+        }
+        try:
+            if judgement_id:
+                # 这一行在收到消息时就占好了：就地补完，不新开一行
+                ok = self.storage.update_judgement(
+                    judgement_id,
+                    worth=verdict.worth,
+                    scores=verdict.scores(),
+                    decision=decision,
+                    probability=probability,
+                    breakdown=breakdown,
+                    reason=reason,
+                )
+                return int(judgement_id) if ok else 0
+            return self.storage.record_judgement(
+                umo=umo,
+                ts=time.time(),
+                sender=verdict.sender,
+                text=text,
+                worth=verdict.worth,
+                scores=verdict.scores(),
+                decision=decision,
+                probability=probability,
+                breakdown=breakdown,
+                reason=reason,
+            )
+        except Exception as exc:
+            logger.debug(f"intent_router: 写判定流水失败：{exc}")
+            return 0
+
+    # ==================================================================
+    # 放行 / 排队 / 重注入
+    # ==================================================================
+
+    def _release_batch(
+        self, ready: list[dict[str, Any]], items: list[dict[str, Any]], umo: str
+    ) -> None:
+        """一批里被判"该回"的那些：决定真正放行几条。
+
+        ``latest``（默认）只放行最新那条，同一批里更早的几句折成一段背景带上——
+        让她一次把这波话回完，而不是一条消息回一句。``all`` 保持每条各自放行。
+        """
+
+        if not ready:
+            if not self._help_active(umo):
+                return
+            ready = []
+        ordered = sorted(ready, key=lambda entry: int(entry["item"].get("seq") or 0))
+        if self._help_active(umo):
+            # 她正在等群友拿主意：这一批全都交给她（最新那条当正文，其余折成背景），
+            # 而且跳过最小间隔——等建议的时候不该按「别连着开口」压着。
+            newest = max(items, key=lambda item: int(item.get("seq") or 0))
+            picked = [
+                {
+                    "item": newest,
+                    "delay": 0.0,
+                    "judgement": 0,
+                    "help": True,
+                }
+            ]
+            self.counters["help_released"] += 1
+            self._fill_burst_context(picked[0], items, umo)
+        elif self.settings.release_policy == "latest":
+            picked = [ordered[-1]]
+            for entry in ordered[:-1]:
+                self.counters["merged"] += 1
+                self._mark_merged(
+                    entry.get("judgement"),
+                    directed=bool(getattr(entry.get("verdict"), "directed", False)),
+                )
+            self._fill_burst_context(picked[0], items, umo)
+        else:
+            picked = ordered
+        # 这一批判定原样交给下游插件：被拦下的那几条它读不到（它比路由先跑），
+        # 所以放行时一次带全，它才能按 message_id 认领自己已经留过档的每一条。
+        chosen = {int(entry["item"].get("seq") or 0) for entry in picked}
+        payload = self._batch_payload(items, chosen, umo)
+        for entry in picked:
+            entry["decision"] = payload
+            self._release_entry(entry, umo)
+
+    def _batch_payload(
+        self, items: list[dict[str, Any]], chosen: set[int], umo: str
+    ) -> dict[str, Any]:
+        """整批判定（含被合并掉的每一条），交给下游插件的一次性元数据。
+
+        「这句是不是冲她说的」只有判断模型在事前答得出来；下游拿到它，就能给
+        自己已经存下的那几条标上，而不是等回复之后靠主模型猜。
+        """
+
+        batch: list[dict[str, Any]] = []
+        for item in sorted(items, key=lambda entry: int(entry.get("seq") or 0)):
+            verdict = item.get("verdict")
+            batch.append(
+                {
+                    "sender": str(item.get("sender") or ""),
+                    "sender_id": str(item.get("sender_id") or ""),
+                    "message_id": str(item.get("message_id") or ""),
+                    "text": clip(str(item.get("text") or ""), 200),
+                    "released": int(item.get("seq") or 0) in chosen,
+                    "worth": bool(getattr(verdict, "worth", False)),
+                    "directed": bool(getattr(verdict, "directed", False)),
+                    "to": str(getattr(verdict, "to", "") or ""),
+                    "reply_score": float(getattr(verdict, "reply_score", 0.0) or 0.0),
+                    "reason": str(getattr(verdict, "reason", "") or ""),
+                }
+            )
+        return {
+            "umo": umo,
+            "policy": str(getattr(self.settings, "release_policy", "") or "latest"),
+            "at": time.time(),
+            "batch": batch,
+        }
+
+    def _release_entry(self, entry: dict[str, Any], umo: str) -> None:
+        """把一条放回管道：该等就等（意愿排队 + 会话最小间隔），到点再重注入。"""
+
+        delay = max(0.0, float(entry.get("delay") or 0.0))
+        if not entry.get("help"):
+            # 等她拿到回应这一档不受「两次开口的最小间隔」限制
+            cooldown = self._cooldown_wait(umo)
+            if cooldown > delay:
+                delay = cooldown
+        if delay > 0:
+            self.counters["delayed"] += 1
+            self._schedule_release(
+                entry["item"]["event"],
+                delay,
+                lead=str(entry.get("lead") or ""),
+                background=str(entry.get("background") or ""),
+                decision=entry.get("decision"),
+            )
+        else:
+            self._release_now(
+                entry["item"]["event"],
+                str(entry.get("lead") or ""),
+                background=str(entry.get("background") or ""),
+                decision=entry.get("decision"),
+            )
+        # 记的是"真的发出去"的时刻，后面几条都按它算间隔
+        self._last_release[umo] = time.time() + delay
+
+    def _cooldown_wait(self, umo: str) -> float:
+        """离上次开口还差多久：同一条会话里两次放行至少隔这么久。"""
+
+        last = float(self._last_release.get(umo, 0.0))
+        if not last:
+            return 0.0
+        return max(0.0, last + float(self.tunable.reply_cooldown_seconds) - time.time())
+
+    def _burst_lead(
+        self, items: list[dict[str, Any]], chosen: dict[str, Any], umo: str = ""
+    ) -> str:
+        """同一批里比它更早的那几句，折成一小段背景带上。
+
+        这些消息早被打回了，主人格本来只看得见最后一条；带上背景她才接得上话。
+
+        但如果虚拟世界插件**正在照看这个会话**就不拼（返回空串）：它的旁观钩子
+        已经按事件身份把这几条独立留了档，再折一遍文本，主模型请求里同一句话就
+        会出现两份——VM 排除重投事件时只能按事件身份排掉外层那条，排不掉正文里
+        内嵌的旧文本。VM 没装 / 没启用 / 没在照看这个会话时照旧拼：批量上下文是
+        给「这几条不会单独进她的提示词」的会话用的，不能一并关掉。
+        """
+
+        if self._vm_context_active(umo):
+            return ""
+        lines = self._burst_lead_lines(items, chosen)
+        if not lines:
+            return ""
+        body = "\n".join(f"- {line}" for line in lines)
+        return f"[群里连着发的几条]\n{body}\n"
+
+    def _burst_background(
+        self, items: list[dict[str, Any]], chosen: dict[str, Any], umo: str = ""
+    ) -> str:
+        """VM 在照看时那几条更早的消息：改从系统提示词补，别让它们凭空消失。
+
+        与 ``_burst_lead`` 是互补关系、只会有一个生效：VM 没在照看时背景走正文，
+        在照看时正文保持干净、背景走提示词。为什么不能干脆"算了不补"：VM 那份
+        旁观记录是"群里发生的事"，不等于"有人点名叫她"——这一批里更早的那条
+        如果正是在叫她，正文里没有、旁听记录里也只是聊天，她就永远不知道自己被叫了。
+        """
+
+        if not self._vm_context_active(umo):
+            return ""
+        lines = self._burst_lead_lines(items, chosen)
+        if not lines:
+            return ""
+        body = "\n".join(f"- {line}" for line in lines)
+        return (
+            "\n\n【这一批里更早的几句（别人说的，只作背景）】\n"
+            f"{body}\n"
+            "接着这个话头就行，不用单独回应这几句。"
+        )
+
+    def _burst_lead_lines(
+        self, items: list[dict[str, Any]], chosen: dict[str, Any]
+    ) -> list[str]:
+        """比 chosen 更早的那几句（``说话人：正文``），最多 ``BURST_LEAD_LINES`` 条。"""
+
+        chosen_seq = int(chosen.get("seq") or 0)
+        lines = [
+            f"{str(item.get('sender') or '有人')}：{clip(str(item.get('text') or ''), 60)}"
+            for item in items
+            if int(item.get("seq") or 0) < chosen_seq and str(item.get("text") or "").strip()
+        ]
+        return lines[-BURST_LEAD_LINES:]
+
+    def _fill_burst_context(
+        self, entry: dict[str, Any], items: list[dict[str, Any]], umo: str
+    ) -> None:
+        """放行的那一条配上"这一批里更早的几句"：优先正文，其次系统提示词背景。"""
+
+        lead = self._burst_lead(items, entry["item"], umo)
+        entry["lead"] = lead
+        if lead:
+            return
+        background = self._burst_background(items, entry["item"], umo)
+        if background:
+            entry["background"] = background
+
+    def _mark_merged(self, judgement: Any, *, directed: bool = False) -> None:
+        """被合并掉的那几条：在流水里补一句，免得看板上看着像回了好几次。"""
+
+        try:
+            judgement_id = int(judgement or 0)
+        except (TypeError, ValueError):
+            return
+        if judgement_id:
+            reason = "；同一批里被合并成一次回复"
+            if directed:
+                reason += "（这句是冲她说的，正文已经作为背景带上了）"
+            self.storage.mark_merged(judgement_id, reason)
+
+    def _schedule_release(
+        self,
+        event: AstrMessageEvent,
+        delay: float,
+        *,
+        lead: str = "",
+        background: str = "",
+        decision: Optional[dict[str, Any]] = None,
+    ) -> None:
+        """排队延迟一会儿再放行（而不是直接拒绝）。"""
+
+        async def later() -> None:
+            try:
+                await asyncio.sleep(max(0.0, delay))
+                self._release_now(event, lead, background=background, decision=decision)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.debug(f"intent_router: 延迟放行失败：{exc}")
+
+        task = asyncio.create_task(later())
+        self._delayed.add(task)
+        task.add_done_callback(self._delayed.discard)
+
+    def _release_now(
+        self,
+        event: AstrMessageEvent,
+        lead: str = "",
+        *,
+        background: str = "",
+        decision: Optional[dict[str, Any]] = None,
+    ) -> None:
+        self._reinject(event, lead=lead, background=background, decision=decision)
+        self.counters["released"] += 1
+
+    def _reinject(
+        self,
+        event: AstrMessageEvent,
+        *,
+        lead: str = "",
+        background: str = "",
+        decision: Optional[dict[str, Any]] = None,
+    ) -> None:
+        """把消息副本（带 At 唤醒标记）放回事件队列，重新走一遍管道。
+
+        ``lead`` 是这一批里更早的几句（见 :meth:`_burst_lead`），拼在正文前面；
+        ``background`` 是同样内容、但走系统提示词的版本（见 :meth:`_burst_background`），
+        用在"正文里不能重复出现"的会话（虚拟世界正在照看）；
+        ``decision`` 是整批判定（见 :meth:`_batch_payload`），原样挂在事件上给
+        下游插件读——批次里被拦下的几条它当时读不到，只有这一次机会拿到。
+        """
+
+        try:
+            new_event = copy.copy(event)
+            if hasattr(new_event, "_force_stopped"):
+                new_event._force_stopped = False
+            if hasattr(new_event, "clear_result"):
+                new_event.clear_result()
+            if hasattr(new_event, "_has_send_oper"):
+                new_event._has_send_oper = False
+            new_event._extras = dict(getattr(event, "_extras", {}) or {})
+            message_obj = getattr(new_event, "message_obj", None)
+            chain = getattr(message_obj, "message", None)
+            self_id = event.get_self_id()
+            if isinstance(chain, list):
+                # 只复制要改的这一层：message_obj 与它自己的消息列表。链不能就地改——
+                # 它属于原事件，队列里别的消费者会看到凭空多出来的 @。也不整个深拷贝：
+                # sender / group / raw_message / message_id 是平台对象的身份，应当共享。
+                new_event.message_obj = copy.copy(message_obj)
+                chain = list(chain)
+                new_event.message_obj.message = chain
+                has_at_self = any(
+                    isinstance(item, At) and str(getattr(item, "qq", "")) == str(self_id)
+                    for item in chain
+                )
+                if not has_at_self:
+                    # 补一个 @ 只是为了让消息重新走通管道（下游按"有人叫她"处理）。
+                    # 但原话里其实没 @ 她，所以要留个标记：别的插件用它区分
+                    # 「真的被点名」和「顺着话题对她说」。
+                    chain.insert(0, At(qq=self_id, name=self_id))
+                    new_event.set_extra(NO_AT_EXTRA, True)
+            if lead:
+                body = str(new_event.message_str or "").strip()
+                head = str(lead).strip()
+                new_event.message_str = f"{head}\n{body}".strip()
+            new_event.set_extra(REINJECT_EXTRA, True)
+            if background:
+                # 正文里没拼（VM 在照看），改挂在事件上，由 on_llm_request 补进系统提示词
+                new_event.set_extra(BACKGROUND_EXTRA, background)
+            if decision:
+                new_event.set_extra(DECISION_EXTRA, decision)
+            self.context.get_event_queue().put_nowait(new_event)
+        except Exception as exc:
+            self.counters["reinject_failed"] += 1
+            logger.error(f"intent_router: 重注入失败：{exc}")
+
+    # ==================================================================
+    # 判断模型
+    # ==================================================================
+
+    async def _judge(self, items: list[dict[str, Any]], umo: str) -> dict[int, Verdict]:
+        """调路由模型，一次判一批。返回 ``{idx: Verdict}``（失败返回空）。"""
+
+        if not items:
+            return {}
+        history = self._history_lines(umo)
+        payload = [
+            {
+                "idx": index,
+                "sender": item["sender"],
+                "label": item["label"],
+                "text": item["text"],
+                "alias_hits": list(item.get("alias_hits") or []),
+            }
+            for index, item in enumerate(items, start=1)
+        ]
+        system_prompt = self.judge_prompt.system()
+        user_prompt = self.judge_prompt.user(payload, history)
+        raw, error = await self._call_judge(system_prompt, user_prompt, umo)
+        self.counters["judge_calls"] += 1
+        self.counters["judged"] += len(items)
+        if error or not raw:
+            logger.warning(f"intent_router: 判断失败：{error or '没有返回内容'}")
+            return {}
+        verdicts = parse_judge_output(raw)
+        if not verdicts:
+            logger.warning(f"intent_router: 判断输出解析失败：{clip(raw, 120)}")
+            return {}
+        return verdicts
+
+    async def _call_judge(
+        self, system_prompt: str, user_prompt: str, umo: str
+    ) -> tuple[str, str]:
+        """调用判断模型，返回 ``(原始文本, 错误说明)``。"""
+
+        provider = None
+        if self.settings.judge_provider_id:
+            try:
+                provider = self.context.get_provider_by_id(self.settings.judge_provider_id)
+            except Exception:
+                provider = None
+            if provider is None:
+                logger.warning(
+                    "intent_router: 找不到判断用的 Provider「%s」，改用会话默认",
+                    self.settings.judge_provider_id,
+                )
+        if provider is None:
+            try:
+                provider = await self.context.get_using_provider_async(umo)
+            except Exception as exc:
+                return "", f"没有可用的判断模型：{exc}"
+        if provider is None:
+            return "", "没有可用的判断模型"
+
+        kwargs: dict[str, Any] = {
+            "temperature": max(0.0, min(0.3, float(self.settings.temperature))),
+            "max_tokens": int(self.settings.max_tokens),
+        }
+        if self.settings.json_mode:
+            kwargs["response_format"] = {"type": "json_object"}
+        async with self._judge_semaphore:
+            try:
+                response = await provider.text_chat(
+                    prompt=user_prompt, system_prompt=system_prompt, **kwargs
+                )
+            except Exception as exc:
+                logger.debug(f"intent_router: 带参调用失败（{exc}），退回最小参数重试")
+                try:
+                    response = await provider.text_chat(
+                        prompt=user_prompt, system_prompt=system_prompt
+                    )
+                except Exception as retry_exc:
+                    return "", str(retry_exc)
+        if response is None:
+            return "", "判断模型没有返回内容"
+        self._record_usage(response)
+        raw = str(getattr(response, "completion_text", "") or "")
+        if self.debug:
+            logger.info("intent_router 判断输出：\n%s", raw)
+        return raw, ""
+
+    def _record_usage(self, response: Any) -> None:
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return
+        for key, attr in (
+            ("prompt_tokens", "input"),
+            ("completion_tokens", "output"),
+            ("total_tokens", "total"),
+        ):
+            try:
+                self.counters[key] += int(getattr(usage, attr, 0) or 0)
+            except Exception:
+                continue
+
+    # ==================================================================
+    # 小工具
+    # ==================================================================
+
+    @staticmethod
+    def _sender_name(event: AstrMessageEvent) -> str:
+        name = str(event.get_sender_name() or "").strip()
+        return name or str(event.get_sender_id() or "未知用户")
+
+    @staticmethod
+    def _quoted_name(event: AstrMessageEvent) -> str:
+        message_obj = getattr(event, "message_obj", None)
+        for component in list(getattr(message_obj, "message", []) or []):
+            if isinstance(component, Reply):
+                nick = str(getattr(component, "sender_nickname", "") or "").strip()
+                return nick or str(getattr(component, "sender_id", "") or "")
+        return ""
+
+    @staticmethod
+    def _reply_target_id(event: AstrMessageEvent) -> str:
+        """被引用的那条是谁发的（没有引用就返回空串）。
+
+        缓存键与交接元数据都要它：同一句正文「回复机器人」和「回复群友」不是一个意思。
+        """
+
+        message_obj = getattr(event, "message_obj", None)
+        for component in list(getattr(message_obj, "message", []) or []):
+            if isinstance(component, Reply):
+                return str(
+                    getattr(component, "sender_id", "")
+                    or getattr(component, "sender_nickname", "")
+                    or getattr(component, "id", "")
+                    or ""
+                )
+        return ""
+
+    def _history_append(self, umo: str, text: str) -> None:
+        history = self._history.setdefault(umo, deque(maxlen=40))
+        history.append((time.time(), clip(text, 200)))
+
+    def _history_lines(self, umo: str) -> list[str]:
+        """最近群聊（给判断模型当局部上下文），按时间正序。"""
+
+        history = list(self._history.get(umo, []))[-max(0, self.settings.context_len) :]
+        return [f"{time.strftime('%H:%M', time.localtime(ts))} {text}" for ts, text in history]
+    def _virtual_world_plugin(self) -> Any:
+        """在同一个 AstrBot 进程里找「虚拟世界」插件实例（没装返回 None）。"""
+
+        try:
+            from astrbot.core.star.star import star_map
+        except Exception:
+            return None
+        for meta in star_map.values():
+            if getattr(meta, "name", "") == "astrbot_plugin_virtual_world":
+                return getattr(meta, "star_cls", None)
+        return None
+
+    def _vm_context_active(self, umo: str = "") -> bool:
+        """虚拟世界插件在场、开着，而且**正在照看这个会话**吗？
+
+        VM 自带旁观钩子，会按事件身份独立留档群里那几条消息；它拿不到"这一批是
+        路由折过来的"这个信息。所以只要 VM 在照看这个会话，路由就不能把更早几句
+        拼成文本塞进正文（见 :meth:`_burst_lead`），否则同一句话会进主模型请求两遍。
+
+        启用状态以实例属性 ``enabled`` 为准（VM 在 ``__init__`` 里从配置读出来）。
+        VM 装是装了、但没把这个会话加进它的列表时**照旧拼**：那几条不会单独进她的
+        提示词，折成背景反而是这几条唯一的来路（会话列表见
+        ``core/engine.py`` 的 ``enabled_session_ids()``，里面的 id 与这里的 umo
+        是同一套字符串）。
+
+        说不清的时候（没给 umo、VM 版本没有这个方法、调用抛异常）按"在照看"处理：
+        宁可少拼一段背景，也不要重复上下文。
+        """
+
+        vm = self._virtual_world_plugin()
+        if vm is None:
+            return False
+        if not bool(getattr(vm, "enabled", True)):
+            return False
+        target = str(umo or "")
+        if not target:
+            return True
+        engine = getattr(vm, "engine", None)
+        watcher = getattr(engine, "enabled_session_ids", None)
+        if not callable(watcher):
+            return True
+        try:
+            watched = {str(item) for item in (watcher() or []) if str(item)}
+        except Exception as exc:
+            logger.debug(f"intent_router: 读虚拟世界的会话列表失败：{exc}")
+            return True
+        if not watched:
+            # 她那边一个会话都没启用：旁观钩子连留档都不会做（VM 的 handle_incoming
+            # 先过 is_enabled 才会 _record_user_message），折背景没有重复风险
+            return False
+        if target in watched:
+            return True
+        # 容错：配置里写的是短名（比如 vwgroup）时也算它在照看
+        return any(target.endswith(item) or item.endswith(target) for item in watched)
+
+    # ==================================================================
+    # 看板用的 Web API
+    # ==================================================================
+
+    def _register_web_apis(self) -> None:
+        if not self.settings.web_enabled or request is None:
+            return
+        register_api = getattr(self.context, "register_web_api", None)
+        if not callable(register_api):
+            return
+        register = register_api
+        p = PLUGIN_NAME
+        register(f"/{p}/status", self.api_status, ["GET"], "运行状态")
+        register(f"/{p}/stats", self.api_stats, ["GET"], "统计")
+        register(f"/{p}/judgements", self.api_judgements, ["GET"], "判定流水")
+        register(f"/{p}/feedback", self.api_feedback, ["POST"], "标记判定好坏")
+        register(f"/{p}/params", self.api_params, ["GET", "POST"], "核心参数")
+        register(f"/{p}/control", self.api_control, ["POST"], "开关")
+        register(f"/{p}/data", self.api_data, ["GET", "POST"], "导出 / 清空数据")
+
+    def _param_dict(self) -> dict[str, Any]:
+        return {
+            "base_p": self.tunable.base_p,
+            "hard_cap": self.tunable.hard_cap,
+            "rare_threshold": self.tunable.rare_threshold,
+            "confidence_threshold": self.tunable.confidence_threshold,
+            "willingness_floor": self.tunable.willingness_floor,
+            "reply_willingness_line": self.tunable.reply_willingness_line,
+            "penalty_base": self.tunable.penalty_base,
+            "load_penalty_floor": self.tunable.load_penalty_floor,
+            "load_penalty_slope": self.tunable.load_penalty_slope,
+            "silence_bonus_cap": self.tunable.silence_bonus_cap,
+            "half_life_short": self.tunable.half_life_short,
+            "half_life_mid": self.tunable.half_life_mid,
+            "half_life_long": self.tunable.half_life_long,
+            "mix_short": self.tunable.mix_short,
+            "mix_mid": self.tunable.mix_mid,
+            "mix_long": self.tunable.mix_long,
+            "breaker_short_count": self.tunable.breaker_short_count,
+            "breaker_short_window": self.tunable.breaker_short_window,
+            "breaker_mid_count": self.tunable.breaker_mid_count,
+            "breaker_mid_window": self.tunable.breaker_mid_window,
+            "breaker_long_count": self.tunable.breaker_long_count,
+            "breaker_long_window": self.tunable.breaker_long_window,
+            "reply_cooldown_seconds": self.tunable.reply_cooldown_seconds,
+            "reply_queue_delay": self.tunable.reply_queue_delay,
+            "proactive_enabled": self.tunable.proactive_enabled,
+            "willingness_default": self.tunable.willingness_default,
+            "vm_timeout": self.tunable.vm_timeout,
+            "vm_breaker_threshold": self.tunable.vm_breaker_threshold,
+            "vm_breaker_cooldown": self.tunable.vm_breaker_cooldown,
+            "keep_days": self.tunable.keep_days,
+        }
+
+    def _status_dict(self) -> dict[str, Any]:
+        try:
+            sessions = sorted(self.storage.counts_by_umo(time.time() - 7 * 86400))
+        except Exception:
+            sessions = []
+        return {
+            "enable": bool(self.enable),
+            "proactive_enabled": bool(self.tunable.proactive_enabled),
+            "judge_provider_id": self.settings.judge_provider_id,
+            "batch": {
+                "enabled": bool(self.settings.enable_batch),
+                "size": self.settings.batch_size,
+                "interval": self.settings.batch_interval,
+                "adaptive": bool(self.settings.adaptive),
+                "interval_min": self.settings.interval_min,
+                "interval_step": self.settings.interval_step,
+                "buffer_seconds": self.settings.buffer_seconds,
+                "release_policy": self.settings.release_policy,
+            },
+            "context_len": self.settings.context_len,
+            "groups": {
+                "whitelist": list(self.settings.whitelist),
+                "blacklist": list(self.settings.blacklist),
+            },
+            "aliases": list(self.settings.aliases),
+            "bot_name": self.settings.bot_name,
+            "persona_chars": len(self.settings.bot_persona or ""),
+            "vm_linked": self._virtual_world_plugin() is not None,
+            "willingness_provider": self.provider.status(),
+            "storage": self.storage.stats(),
+            "counters": dict(self.counters),
+            "cache_hits": self.cache.hits,
+            "buffered": {umo: len(buf) for umo, buf in self._buffers.items() if buf},
+            "sessions": sessions,
+        }
+
+    async def api_status(self):
+        return json_response(self._status_dict())
+
+    async def api_stats(self):
+        umo = str(request.query.get("session", "") or "")
+        try:
+            window = float(request.query.get("window", 604800) or 604800)
+        except (TypeError, ValueError):
+            window = 604800
+        try:
+            limit = int(request.query.get("limit", 50) or 50)
+        except (TypeError, ValueError):
+            limit = 50
+        report = build_report(
+            storage=self.storage,
+            provider_status=self.provider.status(),
+            counters=self.counters,
+            tunable=self.tunable,
+            umo=umo,
+            window_seconds=window,
+            recent_limit=max(1, min(200, limit)),
+        )
+        return json_response(report)
+
+    async def api_judgements(self):
+        umo = str(request.query.get("session", "") or "")
+        try:
+            limit = int(request.query.get("limit", 50) or 50)
+        except (TypeError, ValueError):
+            limit = 50
+        rows = self.storage.recent_judgements(umo=umo, limit=max(1, min(500, limit)))
+        return json_response({"judgements": rows})
+
+    async def api_feedback(self):
+        payload = await request.json(default={}) or {}
+        try:
+            judgement_id = int(payload.get("id"))
+        except (TypeError, ValueError):
+            return error_response("缺少判定 id")
+        value = str(payload.get("value") or "")
+        if value not in ("good", "bad", ""):
+            return error_response("value 只能是 good / bad / 空")
+        ok = self.storage.set_feedback(judgement_id, value)
+        return json_response({"ok": bool(ok)})
+
+    async def api_params(self):
+        if request.method == "POST" or str(request.query.get("_method", "")).upper() == "POST":
+            payload = await request.json(default={}) or {}
+            if payload.get("reset"):
+                self.tunable = self.overrides.reset()
+            else:
+                incoming = payload.get("params")
+                if not isinstance(incoming, dict):
+                    return error_response("params 必须是对象")
+                merged = {**self._param_dict(), **incoming}
+                self.tunable = self.overrides.save(Tunable(**merged))
+            self.registry.set_tunable(self.tunable)
+            self.provider.set_tunable(self.tunable)
+            logger.info("intent_router: 看板更新了核心参数")
+            return json_response({"ok": True, "params": self._param_dict()})
+        return json_response({"params": self._param_dict()})
+
+    async def api_control(self):
+        payload = await request.json(default={}) or {}
+        changed: list[str] = []
+        if "enable" in payload:
+            self.enable = bool(payload.get("enable"))
+            self.runtime.save({"enable": self.enable})
+            changed.append(f"插件已{'开启' if self.enable else '关闭'}")
+        if "proactive_enabled" in payload:
+            self.tunable = self.overrides.save(
+                Tunable(**{**self._param_dict(), "proactive_enabled": bool(payload.get("proactive_enabled"))})
+            )
+            self.registry.set_tunable(self.tunable)
+            self.provider.set_tunable(self.tunable)
+            changed.append(
+                f"主动插嘴已{'开启' if self.tunable.proactive_enabled else '关闭'}"
+            )
+        return json_response(
+            {"ok": True, "changed": changed, "enable": self.enable, "status": self._status_dict()}
+        )
+
+    async def api_data(self):
+        if request.method == "POST" or str(request.query.get("_method", "")).upper() == "POST":
+            payload = await request.json(default={}) or {}
+            if payload.get("clear"):
+                tables = payload.get("tables") or ["speech", "judgement"]
+                self.storage.clear(tuple(str(item) for item in tables))
+                self.cache.clear()
+                return json_response({"ok": True})
+            if payload.get("prune"):
+                removed = self.storage.prune(self.tunable.keep_days)
+                return json_response({"ok": True, "removed": removed})
+            return error_response("没什么可做的")
+        umo = str(request.query.get("session", "") or "")
+        rows = self.storage.recent_judgements(umo=umo, limit=5000)
+        speech = self.storage.speech_since(umo, 0.0) if umo else []
+        return json_response(
+            {
+                "exported_at": time.time(),
+                "params": self._param_dict(),
+                "judgements": rows,
+                "speech_count": len(speech),
+            }
+        )

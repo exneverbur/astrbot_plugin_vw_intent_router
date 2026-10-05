@@ -1,0 +1,226 @@
+{
+  "enable": {
+    "description": "启用插件",
+    "hint": "关闭后本插件不监听任何消息，群聊完全按 AstrBot 原有方式运作。",
+    "obvious_hint": true,
+    "type": "bool",
+    "default": true
+  },
+  "judge_provider": {
+    "description": "判断用 LLM（下拉选择）",
+    "hint": "只负责给每条消息打分的低成本模型。留空使用会话当前默认 Provider。建议新建一个用便宜模型（如 gpt-4o-mini / deepseek-chat）的 Provider，和主人格分开。",
+    "_special": "select_provider",
+    "obvious_hint": true,
+    "type": "string",
+    "default": ""
+  },
+  "bot_name": {
+    "description": "机器人名字",
+    "hint": "判断时告诉她「谁在说话」，填她在群里的名字即可。留空用「这个机器人」。",
+    "type": "string",
+    "default": ""
+  },
+  "bot_aliases": {
+    "description": "别名 / 昵称",
+    "hint": "群友平时怎么叫她（一条一个）。默认只当判断的线索（命中会提醒模型「更可能是在叫她」）；想要老行为就改下面的「命中别名怎么办」。",
+    "type": "list",
+    "default": []
+  },
+  "alias_policy": {
+    "description": "命中别名怎么办",
+    "hint": "交给判断（默认）：命别名只当加分线索，仍然判断这句话在对谁说；直接放行：老行为，命别名就不判断、直接交给她。",
+    "type": "string",
+    "default": "judge",
+    "options": {
+      "judge": "交给判断（推荐）",
+      "direct": "直接放行（省一次判断）"
+    }
+  },
+  "persona": {
+    "description": "简略人设",
+    "hint": "一句话说明她是谁、会接什么话题。越简略越省 token，不用写完整人设。",
+    "obvious_hint": true,
+    "type": "text",
+    "default": "你是群里的傲娇网瘾 AI 少女。群友会叫你「大肥鱼」「蓝色小虎鲸」——有人这样叫你时就是在叫你本人。遇到美食、AI 技术、编程、吐槽、求助这类话题会主动搭话；纯表情复读、普通寒暄不会参与。"
+  },
+  "group_rules": {
+    "description": "群规 / 禁忌",
+    "hint": "这个群不能聊什么、不能做什么。写进判断提示词，越具体越有用。留空表示没有特别规定。",
+    "type": "text",
+    "default": ""
+  },
+  "enable_batch": {
+    "description": "批量判断",
+    "hint": "开启后攒几条一次判（省 token、允许上下文推断）；关闭则每条即时判断（更快但更贵）。",
+    "type": "bool",
+    "default": true
+  },
+  "batch_size": {
+    "description": "攒够几条就判断",
+    "hint": "缓冲里攒够这么多条就立刻判断，不等剩下的等待时间。默认 5 条。",
+    "type": "int",
+    "default": 5
+  },
+  "batch_interval": {
+    "description": "最长等待秒数",
+    "hint": "首条消息进队后最多等这么久就强制判断（硬上限，自适应也不会超过它）。也是无指向消息的最长回复延迟。默认 30。",
+    "type": "int",
+    "default": 30
+  },
+  "adaptive": {
+    "description": "自适应等待",
+    "hint": "开着：首批消息随机等 interval_min~2×interval_min 秒，之后每来一条新消息再多等 0~interval_step 秒，最多到 batch_interval。冷群回得快，火热群会等到大家说完再开口。关掉则固定等到 batch_interval。默认开。",
+    "type": "bool",
+    "default": true
+  },
+  "interval_min": {
+    "description": "冷群最短等待秒数",
+    "hint": "自适应开启时，只有一两条消息时的大致等待时间（实际取 interval_min~2×interval_min 之间的随机值，不超过 batch_interval）。默认 5。",
+    "type": "int",
+    "default": 5
+  },
+  "interval_step": {
+    "description": "每条新消息再加多少秒",
+    "hint": "自适应开启时，缓冲里每新来一条消息就随机延长 0~interval_step 秒，让火热群多攒几句再判断。填 0 = 新消息不再延长。默认 8。",
+    "type": "int",
+    "default": 8
+  },
+  "buffer_age": {
+    "description": "过期消息丢弃秒数",
+    "hint": "缓冲里超过这么久还没判的消息直接丢掉，避免回复几十秒前的话题。默认 120。",
+    "type": "int",
+    "default": 120
+  },
+  "context_len": {
+    "description": "带几条群聊当上下文",
+    "hint": "判断时附上的最近消息条数（每条会截断）。0 表示不带上下文。默认 10。",
+    "type": "int",
+    "default": 10
+  },
+  "min_length": {
+    "description": "少于几个字不判断",
+    "hint": "太短的消息直接当噪音丢掉，默认 2。",
+    "type": "int",
+    "default": 2
+  },
+  "noise_words": {
+    "description": "噪音词",
+    "hint": "整条消息就是这些词（打卡、签到之类）时直接丢掉，不花钱判断。",
+    "type": "list",
+    "default": ["打卡", "签到", "冒泡", "收到", "顶", "+1"]
+  },
+  "pass_prefix": {
+    "description": "直接放行的前缀",
+    "hint": "以这些前缀开头的消息直接放行（不判断）。例如「。」「~」。",
+    "type": "list",
+    "default": []
+  },
+  "whitelist": {
+    "description": "只在哪些群生效",
+    "hint": "填群号。留空表示所有群都生效。",
+    "type": "list",
+    "default": []
+  },
+  "blacklist": {
+    "description": "哪些群不生效",
+    "hint": "填群号，优先级高于白名单。",
+    "type": "list",
+    "default": []
+  },
+  "block_words": {
+    "description": "安全层：屏蔽词",
+    "hint": "消息命中就完全不动（连判断都不做）。",
+    "type": "list",
+    "default": []
+  },
+  "flag_words": {
+    "description": "安全层：需要留意的词",
+    "hint": "命中会记进判定流水，方便回头翻。",
+    "type": "list",
+    "default": []
+  },
+  "block_regex": {
+    "description": "安全层：屏蔽正则",
+    "hint": "进阶用，正则匹配到就拦下。",
+    "type": "list",
+    "default": []
+  },
+  "max_text_length": {
+    "description": "安全层：消息长度上限",
+    "hint": "超过就当垃圾消息拦掉，默认 2000。",
+    "type": "int",
+    "default": 2000
+  },
+  "release": {
+    "description": "一批里放行几条",
+    "hint": "latest = 一批里只放行最新那条，更早的几句折成背景带上；all = 每条各自放行。默认 latest。",
+    "type": "string",
+    "default": "latest"
+  },
+  "fail_mode": {
+    "description": "判断失败时怎么办",
+    "hint": "block = 当作不值得回（安静）；pass = 放行交给主人格。默认 block。",
+    "type": "string",
+    "default": "block"
+  },
+  "passthrough": {
+    "description": "其他插件已回复的不重复回",
+    "hint": "开启后，如果这条消息已经被别的插件发过消息，就跳过它。",
+    "type": "bool",
+    "default": true
+  },
+  "cache": {
+    "description": "复用判断结果",
+    "hint": "同一条消息（同群同文本）在缓存期内直接复用上次的判断，不重复花钱。",
+    "type": "bool",
+    "default": true
+  },
+  "cache_ttl": {
+    "description": "缓存有效期（秒）",
+    "hint": "默认 300。",
+    "type": "int",
+    "default": 300
+  },
+  "cache_cap": {
+    "description": "缓存条数上限",
+    "hint": "默认 2000，超出清掉一半。",
+    "type": "int",
+    "default": 2000
+  },
+  "json_mode": {
+    "description": "要求模型输出 JSON 模式",
+    "hint": "支持的 Provider 上更稳；不支持会自动降级重试。",
+    "type": "bool",
+    "default": true
+  },
+  "temperature": {
+    "description": "判断温度",
+    "hint": "判断任务要稳定，建议 0~0.2。默认 0.1。",
+    "type": "float",
+    "default": 0.1
+  },
+  "max_tokens": {
+    "description": "判断输出上限",
+    "hint": "只输出分数，80~120 够用。默认 120。",
+    "type": "int",
+    "default": 120
+  },
+  "concurrency": {
+    "description": "同时判断几批",
+    "hint": "默认 4。",
+    "type": "int",
+    "default": 4
+  },
+  "web_enabled": {
+    "description": "启用网页看板",
+    "hint": "插件详情页里的「意图路由看板」。",
+    "type": "bool",
+    "default": true
+  },
+  "debug": {
+    "description": "调试日志",
+    "hint": "把每次判断的输入输出写进 AstrBot 日志（含群聊内容，注意隐私）。",
+    "type": "bool",
+    "default": false
+  }
+}
